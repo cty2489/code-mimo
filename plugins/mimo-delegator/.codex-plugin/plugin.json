@@ -1,0 +1,26 @@
+{
+  "name": "mimo-delegator",
+  "version": "0.1.0",
+  "description": "Delegate large coding tasks to MiMo CLI via MCP, saving Codex context tokens while maintaining quality through file-scope guards and verification gates.",
+  "author": {
+    "name": "cty2489",
+    "url": "https://github.com/cty2489"
+  },
+  "homepage": "https://github.com/cty2489/code-mimo",
+  "repository": "https://github.com/cty2489/code-mimo",
+  "keywords": ["codex", "mcp", "mimo", "delegation", "token-saving"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MiMo Delegator",
+    "shortDescription": "Delegate large coding tasks to MiMo, save Codex tokens.",
+    "longDescription": "Runs MiMo CLI as a subprocess with file-scope guards and automatic retry on verification failure. Codex retains full control over acceptance.",
+    "developerName": "cty2489",
+    "category": "Productivity",
+    "websiteURL": "https://github.com/cty2489/code-mimo",
+    "capabilities": ["delegate_task", "continue_task", "task_result"],
+    "defaultPrompt": [
+      "Delegate a large coding task to MiMo and independently verify the result."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mimoDelegator": {
+      "command": "python3",
+      "args": ["scripts/mimo_mcp_server.py"],
+      "cwd": "."
+    }
+  }
+}

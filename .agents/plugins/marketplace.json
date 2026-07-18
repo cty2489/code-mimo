@@ -1,0 +1,20 @@
+{
+  "name": "code-mimo",
+  "interface": {
+    "displayName": "Code MiMo"
+  },
+  "plugins": [
+    {
+      "name": "mimo-delegator",
+      "source": {
+        "source": "local",
+        "path": "./plugins/mimo-delegator"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

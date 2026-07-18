@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to MiMo"
+  short_description: "Delegate large tasks to MiMo CLI, save Codex tokens."
+  default_prompt: "Use $delegate-to-mimo to delegate a large coding task to MiMo via delegate_task, then independently verify the result."
