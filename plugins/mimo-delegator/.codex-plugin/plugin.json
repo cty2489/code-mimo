@@ -1,7 +1,7 @@
 {
   "name": "mimo-delegator",
-  "version": "0.1.0",
-  "description": "Delegate large coding tasks to MiMo CLI via MCP, saving Codex context tokens while maintaining quality through file-scope guards and verification gates.",
+  "version": "0.2.0",
+  "description": "将编码任务委派给 MiMo CLI 后台 Worker；支持 pure 隔离、范围保护、取消和验证。 Delegate coding tasks with isolation, scope guards, cancellation, and verification.",
   "author": {
     "name": "cty2489",
     "url": "https://github.com/cty2489"
@@ -12,14 +12,14 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "MiMo Delegator",
-    "shortDescription": "Delegate large coding tasks to MiMo, save Codex tokens.",
-    "longDescription": "Runs MiMo CLI as a subprocess with file-scope guards and automatic retry on verification failure. Codex retains full control over acceptance.",
+    "shortDescription": "委派大型任务给 MiMo，节省 Codex Token / Delegate large tasks and save Codex tokens.",
+    "longDescription": "通过持久后台 Worker 运行 MiMo CLI，并提供 pure 隔离、紧凑状态查询、取消、文件范围保护和验证重试；Codex 保留最终验收权。 Runs MiMo in persistent workers with isolation, status checks, cancellation, scope guards, and verification retries; Codex retains acceptance control.",
     "developerName": "cty2489",
     "category": "Productivity",
     "websiteURL": "https://github.com/cty2489/code-mimo",
-    "capabilities": ["delegate_task", "continue_task", "task_result"],
+    "capabilities": ["delegate_task", "continue_task", "task_result", "wait_task", "cancel_task"],
     "defaultPrompt": [
-      "Delegate a large coding task to MiMo and independently verify the result."
+      "将大型编码任务委派给 MiMo，并独立验证结果。 Delegate a large coding task to MiMo and independently verify the result."
     ]
   },
   "mcpServers": "./.mcp.json"
