@@ -16,9 +16,11 @@
 - 强制提供明确的文件白名单，并报告检测到的白名单外修改。
 - 每次 MiMo 正常完成且通过修改范围检查后，运行可信的测试、Lint 或构建命令。
 - 验证失败时，自动要求同一个 MiMo 会话重试，直至达到最大尝试次数。
-- 向 Codex 返回紧凑摘要，同时将完整 MiMo 输出保存在本地日志中。
+- 分层结果返回：`task_result` 默认返回 brief 摘要（计数和结论），可选 summary 级别返回完整文件列表和验证详情。
+- 按需取证：`task_evidence` 返回有界日志片段和验证输出，避免原始大日志回灌上下文。
+- 心跳监测：Worker 每 30 秒更新心跳；心跳过期自动标记 stalled，进程消失标记 worker_crashed，不引入总运行上限。
 - 支持状态查询、短时等待和进程组取消。
-- 提供 `delegate_task`、`continue_task`、`task_result`、`wait_task` 和 `cancel_task` 五个 MCP 工具。
+- 提供 `delegate_task`、`continue_task`、`task_result`、`wait_task`、`cancel_task`、`task_evidence` 和 `doctor` 七个 MCP 工具。
 
 ### 环境要求
 
@@ -72,13 +74,22 @@ export MIMO_EXECUTABLE="/absolute/path/to/mimo"
 如果返回 `running`，任务仍在后台执行：
 
 ```text
-task_result(task_id)            # 立即查询
-wait_task(task_id, 45)          # 最多等待 45 秒
-cancel_task(task_id)            # 请求取消并终止活动进程组
-continue_task(task_id, feedback) # 完成或失败后续接原会话
+task_result(task_id)              # 紧凑 brief 查询
+task_result(task_id, "summary")   # 完整摘要
+task_evidence(task_id)            # 按需取证（日志片段）
+wait_task(task_id, 45)            # 最多等待 45 秒
+cancel_task(task_id)              # 请求取消并终止活动进程组
+continue_task(task_id, feedback)  # 完成或失败后续接原会话
+doctor()                          # 诊断插件健康状态
 ```
 
-状态含义：`queued` 表示等待 Worker 启动，`running` 表示 MiMo 正在执行，`verifying` 表示正在运行验收命令；`success`、`failed`、`stalled`、`scope_violation` 和 `cancelled` 都是终止状态。`stalled` 表示运行或验证超时，需要人工判断；`scope_violation` 表示出现白名单外修改，不能直接续接，必须先审查工作区。
+状态含义：`queued` 表示等待 Worker 启动，`running` 表示 MiMo 正在执行，`verifying` 表示正在运行验收命令；`success`、`failed`、`worker_crashed`、`scope_violation` 和 `cancelled` 是终止状态。`stalled` 会结束当前 `wait_task` 等待，但不一定是最终状态：心跳过期（heartbeat_expired）是可恢复的观测异常，Worker 仍活跃时心跳恢复后任务回到 `running`/`verifying`，Worker 死亡则转为 `worker_crashed`；运行超时（runtime timeout）或验证超时（verification timeout）表示本轮已停止，可通过 `continue_task` 续接。
+
+心跳阈值（默认 300 秒）仅是异常检测指标，不是任务总运行时限。长时间任务正常运行期间心跳会持续更新。`continue_task` 在 Worker 仍活跃但心跳过期时会拒绝，请稍后复查或先 `cancel_task`。
+
+阶段（phase）：`queued → starting → running → verifying → finished`，提供比状态更细粒度的任务进程信息。
+
+恢复意图（resume_intent）：`continue_task` 支持可选的 `resume_intent` 参数（如 `fix_verification`、`resume_work`），记录恢复原因，不影响行为。
 
 不要高频查询长任务。对于数小时任务，保存 `task_id`，稍后再查询最节省 Codex Token。同一个项目目录同时只允许一个委派任务。
 
@@ -103,6 +114,18 @@ MCP 只向 Codex 返回紧凑结果，只有排查问题时才需要读取完整
 - 插件本身不会调用在线大模型 API。MiMo 是否联网以及如何处理数据，取决于你的 MiMo 安装和账号配置。
 - 完整日志可能包含任务提示和模型输出，应按照可能含有敏感项目内容的文件进行管理。
 - 建议始终在有版本控制的项目中运行插件，以便审查和恢复修改。
+
+### 健康检查
+
+MCP 工具 `doctor()` 诊断插件健康状态：检查 MiMo 可执行文件及版本、状态目录可写性、损坏状态文件、残留锁、孤儿进程、已安装版本。仅读取不修改，返回中英双语诊断结论。
+
+命令行等价用法：
+
+```bash
+python3 plugins/mimo-delegator/scripts/mimo_mcp_server.py --doctor
+```
+
+CLI 有异常时返回非零退出码。可设置 `MIMO_DELEGATOR_SOURCE_PATH` 指向源码仓库中 `.codex-plugin/plugin.json` 的绝对路径，doctor 会比对已安装版本与源码版本是否一致。
 
 ### 开发与测试
 
@@ -129,9 +152,11 @@ The goal is to reduce Codex context and token use without treating a lower-cost 
 - Requires an explicit file allowlist and reports detected changes outside that scope.
 - Runs trusted test, lint, or build commands after each MiMo attempt that exits normally and passes the scope check.
 - Automatically asks the same MiMo session to retry failed verification, up to the configured maximum number of attempts.
-- Returns compact summaries to Codex while keeping full MiMo output in local log files.
+- Layered results: `task_result` defaults to brief summary (counts and conclusions), with optional summary level for full file lists and verification details.
+- On-demand evidence: `task_evidence` returns bounded log snippets and verification output, preventing raw log flooding into context.
+- Heartbeat monitoring: workers update heartbeat every 30s; stale heartbeat marks `stalled`, missing process marks `worker_crashed`, no total runtime limit imposed.
 - Supports compact status checks, bounded waiting, and process-group cancellation.
-- Provides `delegate_task`, `continue_task`, `task_result`, `wait_task`, and `cancel_task` MCP tools.
+- Provides `delegate_task`, `continue_task`, `task_result`, `wait_task`, `cancel_task`, `task_evidence`, and `doctor` MCP tools.
 
 ### Requirements
 
@@ -185,13 +210,22 @@ The main `delegate_task` tool accepts:
 When the result is `running`, the task continues in the background:
 
 ```text
-task_result(task_id)             # immediate status
-wait_task(task_id, 45)           # wait up to 45 seconds
-cancel_task(task_id)             # cancel the active process group
-continue_task(task_id, feedback) # resume the existing session after completion or failure
+task_result(task_id)              # brief status query
+task_result(task_id, "summary")   # full summary with file lists
+task_evidence(task_id)            # on-demand evidence (log snippets)
+wait_task(task_id, 45)            # wait up to 45 seconds
+cancel_task(task_id)              # cancel the active process group
+continue_task(task_id, feedback)  # resume the existing session after completion or failure
+doctor()                          # diagnose plugin health
 ```
 
-Status meanings: `queued` is waiting for the worker to start, `running` is active MiMo work, and `verifying` is running acceptance commands. `success`, `failed`, `stalled`, `scope_violation`, and `cancelled` are terminal. `stalled` means MiMo or verification timed out and needs review. `scope_violation` means files outside the allowlist changed; it cannot be continued until the worktree is inspected.
+Status meanings: `queued` is waiting for the worker to start, `running` is active MiMo work, and `verifying` is running acceptance commands. `success`, `failed`, `worker_crashed`, `scope_violation`, and `cancelled` are terminal. `stalled` ends the current `wait_task` but is not necessarily final: heartbeat expired (heartbeat_expired) is a recoverable observational anomaly — if the worker is still alive and sends a fresh heartbeat, the task returns to `running`/`verifying`; if the worker dies, it transitions to `worker_crashed`. Runtime timeout or verification timeout means this attempt has stopped and can be resumed via `continue_task`.
+
+The heartbeat threshold (default 300s) is an anomaly detector, not a total task time limit. Long-running tasks update heartbeat continuously during normal operation. `continue_task` rejects when the Worker is still alive but heartbeat expired — check again later or `cancel_task` first.
+
+Phase: `queued → starting → running → verifying → finished` provides finer-grained progress information than status alone.
+
+Resume intent: `continue_task` accepts an optional `resume_intent` parameter (e.g. `fix_verification`, `resume_work`) to record why you are continuing. This is metadata only and does not change behavior.
 
 Do not poll long tasks rapidly. For multi-hour work, retain the `task_id` and check it later to minimize Codex token use. Only one delegated task may run in a workdir at a time.
 
@@ -206,7 +240,7 @@ Task state and full logs are stored outside the project:
 ~/.codex/mimo-delegator/logs/
 ```
 
-Compact MCP responses avoid loading those full logs into Codex context unless troubleshooting is necessary.
+Compact MCP responses avoid loading those full logs into Codex context. Use `task_evidence` for bounded log snippets when troubleshooting is necessary.
 
 ### Safety notes
 
@@ -216,6 +250,18 @@ Compact MCP responses avoid loading those full logs into Codex context unless tr
 - The plugin itself does not call an online model API. MiMo's own network and data behavior depends on your MiMo installation and account configuration.
 - Full logs may contain task prompts and model output, so manage them as files that may include sensitive project content.
 - Run the plugin in a version-controlled project so changes can be reviewed and recovered.
+
+### Health check
+
+The `doctor()` MCP tool diagnoses plugin health: checks the MiMo executable and its `--version`, state directory writability, corrupt state files, stale locks, orphan processes, and installed version. Read-only — returns bilingual (Chinese/English) diagnostic findings.
+
+Equivalent CLI usage:
+
+```bash
+python3 plugins/mimo-delegator/scripts/mimo_mcp_server.py --doctor
+```
+
+The CLI exits with a non-zero code when issues are found. Set `MIMO_DELEGATOR_SOURCE_PATH` to the absolute path of the source repository's `.codex-plugin/plugin.json` file to compare the installed version against the source version.
 
 ### Development and tests
 

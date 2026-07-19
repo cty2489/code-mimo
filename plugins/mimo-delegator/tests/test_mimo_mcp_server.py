@@ -1,5 +1,6 @@
 """Unit and process-level tests for the MiMo Delegator MCP server."""
 
+import datetime
 import json
 import os
 import signal
@@ -216,6 +217,14 @@ class IsolatedStateTest(unittest.TestCase):
     def tearDown(self):
         self.stack.close()
         self.temporary.cleanup()
+        for task_id in list(server._LOCAL_WORKERS):
+            proc = server._LOCAL_WORKERS.pop(task_id, None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
 
     def make_state(self, **overrides):
         task_id = overrides.pop("task_id", server._gen_task_id())
@@ -246,8 +255,61 @@ class TestPersistedState(IsolatedStateTest):
         result = server.task_result(task_id)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["session_id"], "session-1")
-        self.assertEqual(result["changed_files"], ["a.py"])
+        self.assertIn("changed_files_count", result)
         self.assertGreaterEqual(result["elapsed_seconds"], 0)
+
+    def test_brief_omits_full_file_list(self):
+        task_id, _ = self.make_state(changed_files=["a.py", "b.py", "c.py"])
+        brief = server.task_result(task_id, detail="brief")
+        self.assertIn("changed_files_count", brief)
+        self.assertEqual(brief["changed_files_count"], 3)
+        self.assertNotIn("changed_files", brief)
+        self.assertNotIn("key_decisions", brief)
+
+    def test_summary_includes_full_details(self):
+        task_id, _ = self.make_state(
+            changed_files=["a.py"],
+            key_decisions=["used approach X"],
+            known_issues=["flaky test"],
+        )
+        summary = server.task_result(task_id, detail="summary")
+        self.assertIn("changed_files", summary)
+        self.assertEqual(summary["changed_files"], ["a.py"])
+        self.assertIn("key_decisions", summary)
+        self.assertIn("known_issues", summary)
+
+    def test_brief_has_recommended_next_action(self):
+        task_id, _ = self.make_state(status="success")
+        brief = server.task_result(task_id, detail="brief")
+        self.assertIn("recommended_next_action", brief)
+        self.assertIn("inspect", brief["recommended_next_action"])
+
+    def test_brief_has_phase(self):
+        task_id, _ = self.make_state(status="running")
+        brief = server.task_result(task_id, detail="brief")
+        self.assertIn("phase", brief)
+
+    def test_task_result_rejects_invalid_detail(self):
+        task_id, _ = self.make_state()
+        with self.assertRaises(ValueError):
+            server.task_result(task_id, detail="evidence")
+
+    def test_task_result_schema_has_detail_enum(self):
+        import asyncio
+
+        async def _check():
+            tools = await server.mcp.list_tools()
+            for tool in tools:
+                if tool.name == "task_result":
+                    schema = tool.inputSchema
+                    detail_prop = schema["properties"]["detail"]
+                    self.assertEqual(detail_prop["type"], "string")
+                    self.assertEqual(detail_prop["default"], "brief")
+                    self.assertEqual(sorted(detail_prop["enum"]), ["brief", "summary"])
+                    return
+            self.fail("task_result tool not found in MCP tool list")
+
+        asyncio.run(_check())
 
     def test_missing_and_invalid_task_ids_fail(self):
         with self.assertRaises(FileNotFoundError):
@@ -255,12 +317,13 @@ class TestPersistedState(IsolatedStateTest):
         with self.assertRaises(ValueError):
             server.task_result("bad-id")
 
-    def test_dead_worker_is_recovered_as_failed(self):
+    def test_dead_worker_is_recovered_as_worker_crashed(self):
         task_id, _ = self.make_state(
             status="running", worker_pid=999_999_999, finished_ts=None
         )
-        result = server.task_result(task_id)
-        self.assertEqual(result["status"], "failed")
+        with patch.object(server, "_worker_process_matches", return_value=False):
+            result = server.task_result(task_id)
+        self.assertEqual(result["status"], "worker_crashed")
         self.assertIn("unexpectedly", result["summary"])
 
     def test_stale_refresh_does_not_overwrite_newer_terminal_state(self):
@@ -278,7 +341,7 @@ class TestPersistedState(IsolatedStateTest):
         )
         server._save_task_state(task_id, latest)
 
-        with patch.object(server, "_process_alive", return_value=False):
+        with patch.object(server, "_worker_process_matches", return_value=False):
             refreshed = server._refresh_stale_task(stale)
 
         persisted = server._load_task_state(task_id)
@@ -315,7 +378,7 @@ class TestPersistedState(IsolatedStateTest):
         def immediate_result(*_args, **_kwargs):
             return server._task_result_from_state(server._load_task_state(task_id))
 
-        with patch.object(server, "_process_alive", return_value=True):
+        with patch.object(server, "_worker_process_matches", return_value=True):
             with patch.object(
                 server, "_cancel_path", return_value=SuccessBeforeCancelWrite()
             ):
@@ -338,26 +401,18 @@ class TestPersistedState(IsolatedStateTest):
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
             "Path(sys.argv[1]).write_text('ready'); time.sleep(30)"
         )
-        leader_code = (
-            "import subprocess,sys; "
-            "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])"
-        )
-        leader = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                leader_code,
-                descendant_code,
-                str(ready_path),
-            ],
+        descendant = subprocess.Popen(
+            [sys.executable, "-c", descendant_code, str(ready_path)],
             start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        leader.wait(timeout=2)
         deadline = time.monotonic() + 2
         while not ready_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(ready_path.exists(), "descendant process did not start")
-        process_group_id = leader.pid
+        process_group_id = descendant.pid
 
         def process_group_alive():
             try:
@@ -391,13 +446,14 @@ class TestPersistedState(IsolatedStateTest):
 
         try:
             with patch.object(server, "_process_alive", side_effect=process_alive):
-                with patch.object(
-                    server, "_release_workdir", side_effect=release_after_child_stopped
-                ) as release:
-                    refreshed = server._refresh_stale_task(
-                        server._load_task_state(task_id)
-                    )
-            self.assertEqual(refreshed["status"], "failed")
+                with patch.object(server, "_worker_process_matches", side_effect=lambda pid, tid="": process_alive(pid)):
+                    with patch.object(
+                        server, "_release_workdir", side_effect=release_after_child_stopped
+                    ) as release:
+                        refreshed = server._refresh_stale_task(
+                            server._load_task_state(task_id)
+                        )
+            self.assertEqual(refreshed["status"], "worker_crashed")
             release.assert_called_once()
         finally:
             if process_group_alive():
@@ -405,6 +461,7 @@ class TestPersistedState(IsolatedStateTest):
                 deadline = time.monotonic() + 2
                 while process_group_alive() and time.monotonic() < deadline:
                     time.sleep(0.02)
+            descendant.wait(timeout=2)
 
     def test_wait_validation(self):
         task_id, _ = self.make_state()
@@ -429,6 +486,40 @@ class TestPersistedState(IsolatedStateTest):
         self.assertEqual(state["max_runtime_seconds"], 123)
         self.assertEqual(state["verification_timeout_seconds"], 123)
         self.assertTrue(state["pure"])
+        self.assertEqual(state["phase"], "finished")
+        self.assertIsNone(state["last_heartbeat_at"])
+        self.assertIsNone(state["last_progress_at"])
+        self.assertEqual(state["progress_note"], "")
+
+    def test_old_state_without_new_fields_gets_defaults(self):
+        task_id = server._gen_task_id()
+        server._task_path(task_id).write_text(
+            json.dumps({"task_id": task_id, "status": "running", "workdir": "/tmp"})
+        )
+        state = server._load_task_state(task_id)
+        self.assertEqual(state["phase"], "running")
+        self.assertIsNone(state["last_heartbeat_at"])
+        self.assertEqual(state["progress_note"], "")
+        self.assertEqual(state["key_decisions"], [])
+        self.assertEqual(state["known_issues"], [])
+
+    def test_stalled_from_heartbeat_expiry(self):
+        old_hb = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=server.STALLED_HEARTBEAT_SECONDS + 10)
+        ).isoformat()
+        task_id, _ = self.make_state(
+            status="running",
+            worker_pid=999_999_999,
+            finished_ts=None,
+            last_heartbeat_at=old_hb,
+        )
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            result = server.task_result(task_id)
+        self.assertEqual(result["status"], "stalled")
+        self.assertIn("heartbeat expired", result["summary"])
+        self.assertTrue(result.get("worker_active"))
+        self.assertEqual(result.get("stall_reason"), "heartbeat_expired")
 
 
 FAKE_MIMO = r'''#!/usr/bin/env python3
@@ -540,6 +631,15 @@ class RuntimeIntegrationTest(unittest.TestCase):
                     server.cancel_task(task_id)
             except (FileNotFoundError, ValueError):
                 pass
+            server._reap_local_worker(task_id, 1)
+        for task_id in list(server._LOCAL_WORKERS):
+            proc = server._LOCAL_WORKERS.pop(task_id, None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
         self.stack.close()
         self.temporary.cleanup()
 
@@ -576,7 +676,7 @@ class RuntimeIntegrationTest(unittest.TestCase):
         result = self.delegate()
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["session_id"], "fake-session")
-        self.assertEqual(result["changed_files"], ["result.txt"])
+        self.assertEqual(result["changed_files_count"], 1)
         self.assertIn("--pure", self.read_args()[0])
 
     def test_pure_can_be_disabled_explicitly(self):
@@ -847,6 +947,643 @@ class TestPluginSkillMetadata(unittest.TestCase):
             / "openai.yaml"
         )
         self.assertIn("$delegate-to-mimo", yaml_path.read_text())
+
+
+class TestTaskEvidence(IsolatedStateTest):
+    def test_evidence_returns_log_tail(self):
+        task_id, state = self.make_state()
+        log_path = Path(state["log_path"])
+        lines = [f"line {i}\n" for i in range(100)]
+        log_path.write_text("".join(lines), encoding="utf-8")
+        result = server.task_evidence(task_id, log_tail_lines=10)
+        self.assertIn("line 99", result["log_tail"])
+        self.assertNotIn("line 0", result["log_tail"])
+
+    def test_evidence_log_bounded_by_chars(self):
+        task_id, state = self.make_state()
+        log_path = Path(state["log_path"])
+        log_path.write_text("x" * 100_000, encoding="utf-8")
+        result = server.task_evidence(task_id, log_tail_lines=200)
+        self.assertLessEqual(len(result["log_tail"]), server.MAX_EVIDENCE_CHARS)
+
+    def test_evidence_verification_output(self):
+        task_id, state = self.make_state(
+            verification=[
+                {
+                    "command": "pytest",
+                    "passed": False,
+                    "exit_code": 1,
+                    "stdout": "out" * 100,
+                    "stderr": "err" * 100,
+                }
+            ]
+        )
+        result = server.task_evidence(task_id, verification_output=True)
+        self.assertEqual(len(result["verification"]), 1)
+        self.assertFalse(result["verification"][0]["passed"])
+
+    def test_evidence_verification_disabled_by_default(self):
+        task_id, state = self.make_state(
+            verification=[{"command": "echo ok", "passed": True, "exit_code": 0}]
+        )
+        result = server.task_evidence(task_id)
+        self.assertEqual(result["verification"], [])
+
+    def test_evidence_rejects_invalid_task_id(self):
+        with self.assertRaises(ValueError):
+            server.task_evidence("bad-id")
+
+
+class TestContinueResumeIntent(IsolatedStateTest):
+    def test_resume_intent_stored_in_state(self):
+        task_id, _ = self.make_state(status="failed")
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch.object(server, "_claim_workdir"):
+                with patch.object(server, "_launch_worker"):
+                    server.continue_task(
+                        task_id, "fix it", resume_intent="fix_verification"
+                    )
+        state = server._load_task_state(task_id)
+        self.assertEqual(state.get("resume_intent"), "fix_verification")
+
+    def test_scope_violation_still_cannot_continue(self):
+        task_id, _ = self.make_state(status="scope_violation")
+        with self.assertRaises(ValueError):
+            server.continue_task(task_id, "try again", resume_intent="retry_transient")
+
+
+class TestPhaseInState(IsolatedStateTest):
+    def test_new_task_starts_with_queued_phase(self):
+        task_id, _ = self.make_state(status="queued")
+        state = server._load_task_state(task_id)
+        self.assertEqual(state["phase"], "queued")
+
+    def test_phase_matches_terminal_status(self):
+        for status in ["success", "failed", "stalled", "cancelled", "worker_crashed"]:
+            task_id, _ = self.make_state(status=status)
+            state = server._load_task_state(task_id)
+            self.assertEqual(state["phase"], "finished", f"phase for {status}")
+
+    def test_heartbeat_fields_present(self):
+        task_id, _ = self.make_state()
+        state = server._load_task_state(task_id)
+        self.assertIn("last_heartbeat_at", state)
+        self.assertIn("last_progress_at", state)
+        self.assertIn("progress_note", state)
+
+
+class TestHeartbeatNotInterruptedByWait(IsolatedStateTest):
+    def test_wait_returns_without_killing_worker(self):
+        task_id, _ = self.make_state(status="running", worker_pid=999_999_999)
+        with patch.object(server, "_process_alive", return_value=True):
+            with patch.object(server, "_refresh_stale_task", side_effect=lambda s: s):
+                result = server.wait_task(task_id, 0)
+        self.assertEqual(result["status"], "running")
+
+
+class RuntimeIntegrationV03Test(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workdir = self.root / "project"
+        self.workdir.mkdir()
+        self.state_home = self.root / "state"
+        self.fake_mimo = self.root / "fake_mimo.py"
+        self.fake_mimo.write_text(FAKE_MIMO)
+        self.fake_mimo.chmod(0o755)
+        self.args_log = self.root / "args.jsonl"
+        self.counter = self.root / "counter.txt"
+        self.task_ids = []
+
+        environment = {
+            "MIMO_DELEGATOR_HOME": str(self.state_home),
+            "MIMO_EXECUTABLE": str(self.fake_mimo),
+            "FAKE_MIMO_ARGS_LOG": str(self.args_log),
+            "FAKE_MIMO_COUNTER": str(self.counter),
+            "FAKE_MIMO_SLEEP_BEFORE": "0",
+            "FAKE_MIMO_SLEEP_AFTER": "0",
+            "FAKE_MIMO_EDIT": "result.txt",
+            "FAKE_MIMO_EDIT_ON_CALL": "1",
+            "FAKE_MIMO_CONTENT": "done",
+            "FAKE_MIMO_SUMMARY": "fake task complete",
+            "FAKE_MIMO_EXIT_CODE": "0",
+            "FAKE_MIMO_SESSION": "fake-session",
+            "FAKE_MIMO_PARTIAL_SLEEP": "0",
+            "FAKE_MIMO_IGNORE_SIGTERM": "0",
+            "FAKE_MIMO_READY": "",
+        }
+        self.stack = ExitStack()
+        self.stack.enter_context(patch.dict(os.environ, environment, clear=False))
+        self.stack.enter_context(patch.object(server, "BASE_DIR", self.state_home))
+        self.stack.enter_context(patch.object(server, "TASKS_DIR", self.state_home / "tasks"))
+        self.stack.enter_context(patch.object(server, "LOGS_DIR", self.state_home / "logs"))
+        self.stack.enter_context(patch.object(server, "LOCKS_DIR", self.state_home / "locks"))
+        server._ensure_dirs()
+
+    def tearDown(self):
+        for task_id in self.task_ids:
+            try:
+                if server.task_result(task_id)["status"] in server.ACTIVE_STATUSES:
+                    server.cancel_task(task_id)
+            except (FileNotFoundError, ValueError):
+                pass
+            server._reap_local_worker(task_id, 1)
+        self.stack.close()
+        self.temporary.cleanup()
+
+    def delegate(self, **overrides):
+        arguments = {
+            "workdir": str(self.workdir),
+            "task": "create result",
+            "allowed_paths": ["result.txt"],
+            "verification_commands": ["test -f result.txt"],
+            "max_iterations": 2,
+            "wait_seconds": 5,
+            "max_runtime_seconds": 0,
+            "verification_timeout_seconds": 5,
+            "pure": True,
+        }
+        arguments.update(overrides)
+        result = server.delegate_task(**arguments)
+        self.task_ids.append(result["task_id"])
+        return result
+
+    def test_brief_result_for_completed_task(self):
+        task_id = self.delegate()["task_id"]
+        result = server.task_result(task_id, detail="brief")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["phase"], "finished")
+        self.assertIn("changed_files_count", result)
+        self.assertIn("verification_conclusion", result)
+        self.assertIn("recommended_next_action", result)
+        self.assertEqual(result["changed_files_count"], 1)
+
+    def test_summary_result_for_completed_task(self):
+        result = server.task_result(self.delegate()["task_id"], detail="summary")
+        self.assertIn("changed_files", result)
+        self.assertIn("key_decisions", result)
+
+    def test_evidence_tool_for_completed_task(self):
+        task_id = self.delegate()["task_id"]
+        evidence = server.task_evidence(task_id, log_tail_lines=10)
+        self.assertIn("log_tail", evidence)
+        self.assertEqual(evidence["status"], "success")
+
+    def test_phase_transitions_during_execution(self):
+        os.environ["FAKE_MIMO_SLEEP_BEFORE"] = "1.2"
+        result = self.delegate(wait_seconds=0)
+        self.task_ids.append(result["task_id"])
+        state = server._load_task_state(result["task_id"])
+        self.assertIn(state["phase"], ("queued", "starting", "running"))
+        final = server.wait_task(result["task_id"], 5)
+        self.assertEqual(final["phase"], "finished")
+
+    def test_heartbeat_updated_during_execution(self):
+        os.environ["FAKE_MIMO_SLEEP_BEFORE"] = "1.5"
+        result = self.delegate(wait_seconds=0)
+        self.task_ids.append(result["task_id"])
+        time.sleep(0.3)
+        state = server._load_task_state(result["task_id"])
+        self.assertIsNotNone(state.get("last_heartbeat_at"))
+        server.cancel_task(result["task_id"])
+
+    def test_worker_crashed_on_dead_worker(self):
+        result = self.delegate(wait_seconds=0)
+        self.task_ids.append(result["task_id"])
+        state = server._load_task_state(result["task_id"])
+        worker_pid = state["worker_pid"]
+        server.cancel_task(result["task_id"])
+        time.sleep(0.3)
+        state = server._load_task_state(result["task_id"])
+        if state["status"] in server.ACTIVE_STATUSES:
+            fake_pid = 999_999_998
+            state["worker_pid"] = fake_pid
+            state["status"] = "running"
+            server._save_task_state(result["task_id"], state)
+            with patch.object(server, "_process_alive", return_value=False):
+                refreshed = server._refresh_stale_task(
+                    server._load_task_state(result["task_id"])
+                )
+            self.assertEqual(refreshed["status"], "worker_crashed")
+
+
+class TestVerificationHeartbeat(IsolatedStateTest):
+    def test_verification_updates_heartbeat_periodically(self):
+        task_id, state = self.make_state(
+            status="running",
+            child_pid=0,
+            verification=[],
+        )
+        state["last_heartbeat_at"] = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=600)
+        ).isoformat()
+        server._save_task_state(task_id, state)
+        with tempfile.TemporaryDirectory() as wd:
+            with patch.object(server, "HEARTBEAT_INTERVAL_SECONDS", 0.1):
+                result = server._run_verification(
+                    Path(wd), ["sleep 0.6"], timeout_seconds=5,
+                    task_id=task_id, state=state,
+                )
+        self.assertTrue(result[0]["passed"])
+        reloaded = server._load_task_state(task_id)
+        hb = reloaded.get("last_heartbeat_at", "")
+        self.assertTrue(hb)
+        hb_time = datetime.datetime.fromisoformat(hb).timestamp()
+        self.assertGreater(hb_time, time.time() - 2)
+
+
+class TestBriefDefaults(IsolatedStateTest):
+    def test_wait_task_returns_brief(self):
+        task_id, _ = self.make_state(
+            status="success",
+            changed_files=["a.py", "b.py"],
+            key_decisions=["approach X"],
+        )
+        result = server.wait_task(task_id, 0)
+        self.assertIn("changed_files_count", result)
+        self.assertNotIn("changed_files", result)
+        self.assertNotIn("key_decisions", result)
+
+    def test_delegate_returns_brief(self):
+        task_id, _ = self.make_state(
+            status="success",
+            changed_files=["a.py"],
+        )
+        result = server.task_result(task_id, detail="brief")
+        self.assertIn("changed_files_count", result)
+        self.assertNotIn("changed_files", result)
+
+
+class TestStalledContinueGuard(IsolatedStateTest):
+    def test_continue_rejects_stalled_with_active_worker(self):
+        task_id, _ = self.make_state(
+            status="stalled",
+            stall_reason="heartbeat_expired",
+            worker_active=True,
+            worker_pid=12345,
+        )
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            with self.assertRaises(ValueError) as ctx:
+                server.continue_task(task_id, "fix it", wait_seconds=0)
+            self.assertIn("stalled", str(ctx.exception))
+            self.assertIn("still running", str(ctx.exception))
+
+    def test_continue_accepts_stalled_without_active_worker(self):
+        task_id, _ = self.make_state(
+            status="stalled",
+            stall_reason="runtime_or_verification_timeout",
+            worker_active=False,
+            worker_pid=0,
+        )
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch.object(server, "_claim_workdir"):
+                with patch.object(server, "_launch_worker"):
+                    with patch.object(server, "_wait_for_task", return_value={"status": "queued"}):
+                        result = server.continue_task(task_id, "fix it", wait_seconds=0)
+        self.assertEqual(result["status"], "queued")
+
+
+class TestWorkerProcessMatches(IsolatedStateTest):
+    def test_returns_false_for_dead_pid(self):
+        self.assertFalse(server._worker_process_matches(999_999_999))
+
+    def test_returns_false_when_cmdline_unavailable(self):
+        with patch.object(server, "_read_process_cmdline", return_value=None):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+    def test_returns_false_for_non_python_process(self):
+        with patch.object(server, "_read_process_cmdline", return_value="/bin/ls -la"):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+    def test_returns_true_for_matching_worker_cmdline(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} --worker mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertTrue(server._worker_process_matches(12345))
+
+    def test_returns_false_for_wrong_script_path(self):
+        cmdline = f"{sys.executable} /wrong/path.py --worker mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+    def test_returns_false_for_python_without_worker_flag(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+
+class TestIsOurWorkerPid(IsolatedStateTest):
+    def test_returns_false_when_cmdline_unavailable(self):
+        with patch.object(server, "_read_process_cmdline", return_value=None):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._is_our_worker_pid(12345, "mimo-abc123def456"))
+
+    def test_returns_false_for_foreign_process(self):
+        cmdline = "/usr/bin/some_other_script.py --worker mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._is_our_worker_pid(12345, "mimo-abc123def456"))
+
+    def test_returns_true_for_exact_match(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} --worker mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertTrue(server._is_our_worker_pid(12345, "mimo-abc123def456"))
+
+    def test_returns_false_for_dead_pid(self):
+        self.assertFalse(server._is_our_worker_pid(999_999_999, "mimo-abc123def456"))
+
+
+class TestDoctor(IsolatedStateTest):
+    def test_doctor_all_ok(self):
+        with patch.object(server, "_locate_mimo", return_value="/usr/bin/true"):
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                args=["--version"], returncode=0, stdout="mimo 1.0.0\n"
+            )):
+                result = server.doctor()
+        self.assertEqual(result["mimo"]["status"], "ok")
+        self.assertIn("1.0.0", result["mimo"]["version"])
+        self.assertIn("All checks passed", result["findings_en"])
+        self.assertIn("一切正常", result["findings_zh"])
+        self.assertIn("version", result)
+
+    def test_doctor_mimo_missing(self):
+        with patch.object(server, "_locate_mimo", side_effect=FileNotFoundError("not found")):
+            result = server.doctor()
+        self.assertEqual(result["mimo"]["status"], "error")
+        self.assertTrue(any("executable" in f.lower() or "可执行" in f for f in result["findings_en"] + result["findings_zh"]))
+
+    def test_doctor_mimo_version_timeout(self):
+        with patch.object(server, "_locate_mimo", return_value="/usr/bin/true"):
+            with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="--version", timeout=5)):
+                result = server.doctor()
+        self.assertEqual(result["mimo"]["status"], "ok")
+        self.assertIn("timeout", result["mimo"]["version"].lower())
+        self.assertTrue(any("version" in f.lower() for f in result["findings_en"] + result["findings_zh"]))
+
+    def test_doctor_corrupt_state(self):
+        corrupt_path = server.TASKS_DIR / "mimo-corrupt.json"
+        corrupt_path.write_text("NOT JSON", encoding="utf-8")
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="mimo 1.0\n"
+            )):
+                result = server.doctor()
+        self.assertTrue(len(result["corrupt_states"]) >= 1)
+        self.assertTrue(any("corrupt" in f.lower() or "损坏" in f for f in result["findings_en"] + result["findings_zh"]))
+
+    def test_doctor_stale_lock(self):
+        task_id, _ = self.make_state(status="success")
+        lock_path = server._workdir_lock_path(Path("/tmp"))
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({"task_id": task_id, "lock_token": "tok"}), encoding="utf-8")
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="mimo 1.0\n"
+            )):
+                result = server.doctor()
+        stale = [l for l in result["stale_locks"] if l["owner_task"] == task_id]
+        self.assertTrue(len(stale) >= 1)
+
+    def test_doctor_dirs_writable(self):
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="mimo 1.0\n"
+            )):
+                result = server.doctor()
+        for d in result["directories"]:
+            self.assertEqual(d["status"], "ok")
+
+    def test_doctor_version_mismatch(self):
+        src = server.TASKS_DIR / "_src_manifest.json"
+        src.write_text(json.dumps({"version": "0.2.0"}), encoding="utf-8")
+        with patch.dict(os.environ, {"MIMO_DELEGATOR_SOURCE_PATH": str(src)}):
+            with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+                with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="mimo 1.0\n"
+                )):
+                    result = server.doctor()
+        self.assertEqual(result["version"].get("source_version"), "0.2.0")
+        self.assertFalse(result["version"].get("version_match", True))
+
+    def test_doctor_cli(self):
+        import subprocess as _sp
+        result = _sp.run(
+            [sys.executable, str(Path(__file__).resolve().parent.parent / "scripts" / "mimo_mcp_server.py"), "--doctor"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "MIMO_EXECUTABLE": "/usr/bin/true", "MIMO_DELEGATOR_HOME": str(server.BASE_DIR)},
+        )
+        data = json.loads(result.stdout)
+        self.assertIn("findings_en", data)
+        self.assertIn("mimo", data)
+        self.assertIn("version", data)
+
+
+class TestHeartbeatRecovery(IsolatedStateTest):
+    def test_heartbeat_recovery_from_stalled(self):
+        old_hb = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=server.STALLED_HEARTBEAT_SECONDS + 10)
+        ).isoformat()
+        task_id, _ = self.make_state(
+            status="running",
+            worker_pid=999_999_999,
+            finished_ts=None,
+            last_heartbeat_at=old_hb,
+        )
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            stalled = server.task_result(task_id)
+        self.assertEqual(stalled["status"], "stalled")
+        self.assertEqual(stalled["stall_reason"], "heartbeat_expired")
+        self.assertTrue(stalled["worker_active"])
+
+        state = server._load_task_state(task_id)
+        state["last_heartbeat_at"] = _now_iso()
+        server._save_task_state(task_id, state)
+
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            recovered = server.task_result(task_id)
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(recovered["phase"], "running")
+        self.assertEqual(recovered["stall_reason"], "")
+
+    def test_stalled_worker_dies_transitions_to_crashed(self):
+        old_hb = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=server.STALLED_HEARTBEAT_SECONDS + 10)
+        ).isoformat()
+        task_id, _ = self.make_state(
+            status="stalled",
+            stall_reason="heartbeat_expired",
+            worker_active=True,
+            worker_pid=999_999_999,
+            finished_ts=None,
+        )
+        with patch.object(server, "_worker_process_matches", return_value=False):
+            with patch.object(server, "_release_workdir"):
+                result = server.task_result(task_id)
+        self.assertEqual(result["status"], "worker_crashed")
+        self.assertFalse(result.get("worker_active"))
+        self.assertEqual(result.get("stall_reason"), "")
+        reloaded = server._load_task_state(task_id)
+        self.assertEqual(reloaded["worker_pid"], 0)
+        self.assertEqual(reloaded["child_pid"], 0)
+
+    def test_stalled_worker_alive_keeps_stalled(self):
+        old_hb = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=server.STALLED_HEARTBEAT_SECONDS + 10)
+        ).isoformat()
+        task_id, _ = self.make_state(
+            status="stalled",
+            stall_reason="heartbeat_expired",
+            worker_active=True,
+            worker_pid=999_999_999,
+            finished_ts=None,
+        )
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            result = server.task_result(task_id)
+        self.assertEqual(result["status"], "stalled")
+        self.assertTrue(result.get("worker_active"))
+
+
+class TestHeartbeatTOCTOU(IsolatedStateTest):
+    def test_heartbeat_refresh_between_reads_prevents_false_stall(self):
+        old_hb = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=server.STALLED_HEARTBEAT_SECONDS + 10)
+        ).isoformat()
+        task_id, _ = self.make_state(
+            status="running",
+            worker_pid=999_999_999,
+            finished_ts=None,
+            last_heartbeat_at=old_hb,
+        )
+        call_count = [0]
+        original_load = server._load_task_state
+
+        def load_with_refresh(*args, **kwargs):
+            state = original_load(*args, **kwargs)
+            call_count[0] += 1
+            if call_count[0] == 2:
+                state["last_heartbeat_at"] = _now_iso()
+            return state
+
+        with patch.object(server, "_worker_process_matches", return_value=True):
+            with patch.object(server, "_load_task_state", side_effect=load_with_refresh):
+                result = server.task_result(task_id)
+        self.assertEqual(result["status"], "running")
+        self.assertNotEqual(result["status"], "stalled")
+
+
+class TestPIDOwnership(IsolatedStateTest):
+    def test_worker_matches_requires_exact_script_path(self):
+        cmdline = "/usr/bin/python3 /wrong/path/mimo_mcp_server.py --worker mimo-abc"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+    def test_worker_matches_requires_worker_flag(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} mimo-abc123def456"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345))
+
+    def test_worker_matches_requires_task_id_in_cmdline(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} --worker other-task-id"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertFalse(server._worker_process_matches(12345, "mimo-abc123def456"))
+
+    def test_worker_matches_without_task_id_skips_taskid_check(self):
+        script = str(Path(server.__file__).resolve())
+        cmdline = f"{sys.executable} {script} --worker other-task-id"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertTrue(server._worker_process_matches(12345))
+
+    def test_may_be_active_conservative_on_unknown(self):
+        with patch.object(server, "_read_process_cmdline", return_value=None):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertTrue(server._process_may_be_active(12345))
+
+    def test_may_be_active_rejects_foreign_python(self):
+        cmdline = "/usr/bin/python3 /other/script.py"
+        with patch.object(server, "_read_process_cmdline", return_value=cmdline):
+            with patch.object(server, "_process_alive", return_value=True):
+                self.assertTrue(server._process_may_be_active(12345))
+
+    def test_may_be_active_rejects_dead(self):
+        self.assertFalse(server._process_may_be_active(999_999_999))
+
+
+class TestContinueClearsMetadata(IsolatedStateTest):
+    def test_continue_clears_old_stall_fields(self):
+        task_id, _ = self.make_state(
+            status="failed",
+            stall_reason="heartbeat_expired",
+            worker_active=True,
+            last_heartbeat_at="2024-01-01T00:00:00+00:00",
+            last_progress_at="2024-01-01T00:00:00+00:00",
+            progress_note="old note",
+        )
+        with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+            with patch.object(server, "_claim_workdir"):
+                with patch.object(server, "_launch_worker"):
+                    server.continue_task(task_id, "fix it", wait_seconds=0)
+        state = server._load_task_state(task_id)
+        self.assertEqual(state["stall_reason"], "")
+        self.assertFalse(state["worker_active"])
+        self.assertIsNone(state["last_heartbeat_at"])
+        self.assertIsNone(state["last_progress_at"])
+        self.assertEqual(state["progress_note"], "")
+
+
+class TestDoctorVersionMismatch(IsolatedStateTest):
+    def test_doctor_reports_version_mismatch(self):
+        src = server.TASKS_DIR / "_src_manifest.json"
+        src.write_text(json.dumps({"version": "0.2.0"}), encoding="utf-8")
+        with patch.dict(os.environ, {"MIMO_DELEGATOR_SOURCE_PATH": str(src)}):
+            with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+                with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="mimo 1.0\n"
+                )):
+                    result = server.doctor()
+        self.assertFalse(result["version"].get("version_match", True))
+        self.assertTrue(any("version mismatch" in f.lower() or "版本不一致" in f for f in result["findings_en"] + result["findings_zh"]))
+
+    def test_doctor_reports_unreadable_source_path(self):
+        with patch.dict(os.environ, {"MIMO_DELEGATOR_SOURCE_PATH": "/nonexistent/path.json"}):
+            with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+                with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="mimo 1.0\n"
+                )):
+                    result = server.doctor()
+        self.assertTrue(any("unreadable" in f.lower() or "不可读" in f for f in result["findings_en"] + result["findings_zh"]))
+
+    def test_doctor_reports_directory_source_path(self):
+        with patch.dict(os.environ, {"MIMO_DELEGATOR_SOURCE_PATH": str(server.TASKS_DIR)}):
+            with patch.object(server, "_locate_mimo", return_value="/bin/true"):
+                with patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="mimo 1.0\n"
+                )):
+                    result = server.doctor()
+        self.assertEqual(result["version"].get("source_version"), "path-is-directory")
+        self.assertTrue(any("unreadable" in f.lower() or "不可读" in f for f in result["findings_en"] + result["findings_zh"]))
+
+
+def _now_iso():
+    return server._now_iso()
 
 
 if __name__ == "__main__":

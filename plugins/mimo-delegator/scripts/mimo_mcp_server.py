@@ -20,7 +20,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -46,6 +46,13 @@ DEFAULT_MAX_ITERATIONS = 3
 LOCK_RESERVATION_GRACE_SECONDS = 30
 HOME = Path.home()
 
+HEARTBEAT_INTERVAL_SECONDS = 30
+STALLED_HEARTBEAT_SECONDS = int(
+    os.environ.get("MIMO_STALLED_HEARTBEAT_SECONDS", "300")
+)
+MAX_EVIDENCE_LOG_LINES = 200
+MAX_EVIDENCE_CHARS = 8000
+
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -62,6 +69,7 @@ TERMINAL_STATUSES = {
     "stalled",
     "scope_violation",
     "cancelled",
+    "worker_crashed",
 }
 
 TASK_ID_RE = re.compile(r"^mimo-[0-9a-f]{12}$")
@@ -252,6 +260,14 @@ def _load_task_state(task_id: str) -> dict[str, Any]:
     state.setdefault(
         "worker_error_path", str(LOGS_DIR / f"{task_id}.worker.log")
     )
+    state.setdefault("phase", _phase_for_status(state.get("status", "queued")))
+    state.setdefault("last_heartbeat_at", None)
+    state.setdefault("last_progress_at", None)
+    state.setdefault("progress_note", "")
+    state.setdefault("key_decisions", [])
+    state.setdefault("known_issues", [])
+    state.setdefault("stall_reason", "")
+    state.setdefault("worker_active", False)
     return state
 
 
@@ -265,6 +281,78 @@ def _process_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _worker_process_matches(pid: int, task_id: str = "") -> bool:
+    """Strict check: returns True only if pid is alive and cmdline matches our worker.
+
+    Returns False for dead, foreign, or unknown (cmdline unreadable) processes.
+    If task_id is provided, also verifies it appears in the command line.
+    Used for ownership decisions where false positives are dangerous.
+    """
+    if not _process_alive(pid):
+        return False
+    cmdline = _read_process_cmdline(pid)
+    if cmdline is None:
+        return False
+    if "python" not in cmdline.lower():
+        return False
+    script = str(Path(__file__).resolve())
+    if script in cmdline and "--worker" in cmdline:
+        if task_id:
+            return task_id in cmdline
+        return True
+    return False
+
+
+def _process_may_be_active(pid: int) -> bool:
+    """Conservative check: returns True if process is alive and might be ours.
+
+    Used for occupancy/lock checks where blocking is safer than releasing.
+    Returns True for alive processes with unreadable cmdline (unknown).
+    """
+    if not _process_alive(pid):
+        return False
+    cmdline = _read_process_cmdline(pid)
+    if cmdline is None:
+        return True
+    if "python" not in cmdline.lower():
+        return False
+    return True
+
+
+def _is_our_worker_pid(pid: int, task_id: str) -> bool:
+    """Strict ownership check for kill decisions. Fail closed: returns False if unsure."""
+    if not _process_alive(pid):
+        return False
+    cmdline = _read_process_cmdline(pid)
+    if cmdline is None:
+        return False
+    script = str(Path(__file__).resolve())
+    if script in cmdline and "--worker" in cmdline and task_id in cmdline:
+        return True
+    return False
+
+
+def _read_process_cmdline(pid: int) -> str | None:
+    """Read process command line. Returns None if unavailable (ps failed, permission, etc)."""
+    try:
+        procfs = Path(f"/proc/{pid}/cmdline")
+        if procfs.exists():
+            raw = procfs.read_bytes()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+    except (OSError, PermissionError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 def _process_group_alive(pid: int) -> bool:
@@ -349,7 +437,7 @@ def _claim_workdir(workdir: Path, task_id: str, lock_token: str) -> None:
                 raise RuntimeError(
                     f"Workdir has a task reservation pending for {existing_id}"
                 )
-            worker_alive = _process_alive(int(existing.get("worker_pid", 0)))
+            worker_alive = _process_may_be_active(int(existing.get("worker_pid", 0)))
             child_alive = _process_group_alive(int(existing.get("child_pid", 0)))
             recently_queued = (
                 existing.get("status") == "queued"
@@ -449,6 +537,28 @@ def _check_scope(
 
 def _gen_task_id() -> str:
     return f"mimo-{uuid.uuid4().hex[:12]}"
+
+
+def _phase_for_status(status: str) -> str:
+    if status in TERMINAL_STATUSES:
+        return "finished"
+    return {"queued": "queued", "running": "running", "verifying": "verifying"}.get(
+        status, "queued"
+    )
+
+
+def _recommend_next_action(status: str) -> str:
+    return {
+        "queued": "wait_task(task_id)",
+        "running": "wait_task(task_id) or check later",
+        "verifying": "wait_task(task_id)",
+        "success": "inspect changes and verify independently",
+        "failed": "continue_task(task_id, feedback) or inspect logs",
+        "stalled": "check worker_active: if true, check again later; if false, continue or cancel",
+        "worker_crashed": "inspect logs; task may need to be restarted",
+        "scope_violation": "inspect worktree; cannot auto-continue",
+        "cancelled": "none",
+    }.get(status, "check task_result(task_id)")
 
 
 def _build_mimo_prompt(
@@ -598,6 +708,7 @@ def _run_verification(
                     state["child_pid"] = proc.pid
                     _save_task_state(state["task_id"], state)
 
+                last_vhb = 0.0
                 while proc.poll() is None:
                     if task_id and _cancel_requested(task_id):
                         cancelled = True
@@ -607,6 +718,12 @@ def _run_verification(
                         timed_out = True
                         _terminate_process(proc)
                         break
+                    if state is not None:
+                        now_mono = time.monotonic()
+                        if now_mono - last_vhb >= HEARTBEAT_INTERVAL_SECONDS:
+                            state["last_heartbeat_at"] = _now_iso()
+                            _save_task_state(state["task_id"], state)
+                            last_vhb = now_mono
                     time.sleep(0.1)
 
                 return_code = proc.wait()
@@ -718,6 +835,7 @@ def _run_mimo_streaming(
         pending_text = ""
         pipe_open = True
         last_state_save = 0.0
+        last_heartbeat = time.monotonic()
 
         def record_text(text: str, flush_partial: bool = False) -> None:
             nonlocal pending_text, session_id, summary, last_state_save
@@ -745,10 +863,13 @@ def _run_mimo_streaming(
                 if parsed["summary"]:
                     summary = parsed["summary"]
                     state["summary"] = summary
+                    state["last_progress_at"] = _now_iso()
+                    state["progress_note"] = summary[:200]
                     saw_compact_event = True
 
             now = time.monotonic()
             if text and (saw_compact_event or now - last_state_save >= 1):
+                state["last_heartbeat_at"] = _now_iso()
                 _save_task_state(task_id, state)
                 last_state_save = now
 
@@ -762,6 +883,12 @@ def _run_mimo_streaming(
                     timed_out = True
                     _terminate_process(proc)
                     break
+
+                now_mono = time.monotonic()
+                if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                    state["last_heartbeat_at"] = _now_iso()
+                    _save_task_state(task_id, state)
+                    last_heartbeat = now_mono
 
                 events = selector.select(timeout=0.25)
                 for _, _ in events:
@@ -820,6 +947,10 @@ def _finalize_state(
     state: dict[str, Any], status: str, summary: str | None = None
 ) -> None:
     state["status"] = status
+    state["phase"] = "finished"
+    state["worker_active"] = False
+    if status == "stalled" and not state.get("stall_reason"):
+        state["stall_reason"] = "runtime_or_verification_timeout"
     if summary is not None:
         state["summary"] = summary[:MAX_SUMMARY_CHARS]
     state["child_pid"] = 0
@@ -841,11 +972,20 @@ def _worker_main(task_id: str) -> int:
 
     state["worker_pid"] = os.getpid()
     state["status"] = "running"
+    state["phase"] = "starting"
     state["started_at"] = _now_iso()
     state["started_ts"] = time.time()
     state["finished_at"] = None
     state["finished_ts"] = None
+    state["last_heartbeat_at"] = _now_iso()
+    state["stall_reason"] = ""
+    state["worker_active"] = True
     resume_feedback = state.pop("resume_feedback", "")
+    resume_intent = state.pop("resume_intent", "")
+    if resume_intent:
+        state.setdefault("key_decisions", []).append(
+            f"resume_intent={resume_intent}"
+        )
     _save_task_state(task_id, state)
 
     message = _build_attempt_message(state, verification_commands, resume_feedback)
@@ -859,6 +999,7 @@ def _worker_main(task_id: str) -> int:
 
             state["iterations"] = int(state.get("iterations", 0)) + 1
             state["status"] = "running"
+            state["phase"] = "running"
             state["verification"] = []
             _save_task_state(task_id, state)
             before = _snapshot_files(workdir)
@@ -904,6 +1045,7 @@ def _worker_main(task_id: str) -> int:
                 return 1
 
             state["status"] = "verifying"
+            state["phase"] = "verifying"
             _save_task_state(task_id, state)
             verification = _run_verification(
                 workdir,
@@ -1011,6 +1153,8 @@ def _terminate_worker(task_id: str, worker_pid: int) -> bool:
             pass
         _reap_local_worker(task_id, 1)
         return proc.poll() is not None
+    if not _is_our_worker_pid(worker_pid, task_id):
+        return False
     return _terminate_orphan_group(worker_pid)
 
 
@@ -1020,11 +1164,78 @@ def _refresh_stale_task(state: dict[str, Any]) -> dict[str, Any]:
         task_id, 1 if state.get("status") in TERMINAL_STATUSES else 0
     )
     latest = _load_task_state(task_id)
+
+    worker_pid = int(latest.get("worker_pid", 0))
+    if worker_pid and _worker_process_matches(worker_pid, task_id):
+        if latest.get("status") == "stalled" and latest.get("stall_reason") == "heartbeat_expired":
+            last_hb = latest.get("last_heartbeat_at")
+            if last_hb:
+                try:
+                    hb_time = datetime.fromisoformat(last_hb).timestamp()
+                    if time.time() - hb_time <= STALLED_HEARTBEAT_SECONDS:
+                        prev_phase = latest.get("phase", "running")
+                        restore_status = "verifying" if prev_phase == "verifying" else "running"
+                        latest["status"] = restore_status
+                        latest["phase"] = restore_status
+                        latest["stall_reason"] = ""
+                        latest["worker_active"] = True
+                        latest["summary"] = ""
+                        _save_task_state(task_id, latest)
+                        return latest
+                except (ValueError, TypeError):
+                    pass
+
+    # For stalled+heartbeat_expired, re-verify worker alive on every check
+    if latest.get("status") == "stalled" and latest.get("stall_reason") == "heartbeat_expired":
+        if worker_pid and _worker_process_matches(worker_pid, task_id):
+            latest["worker_active"] = True
+            _save_task_state(task_id, latest)
+            return latest
+        else:
+            latest["status"] = "worker_crashed"
+            latest["stall_reason"] = ""
+            latest["worker_active"] = False
+            latest["worker_pid"] = 0
+            latest["child_pid"] = 0
+            latest["phase"] = "finished"
+            latest["summary"] = "Worker died while heartbeat-expired; task crashed"
+            latest["finished_at"] = _now_iso()
+            latest["finished_ts"] = time.time()
+            _save_task_state(task_id, latest)
+            _release_workdir(Path(latest["workdir"]), task_id, str(latest.get("lock_token", "")))
+            return latest
+
     if latest.get("status") not in ACTIVE_STATUSES:
         return latest
 
-    worker_pid = int(latest.get("worker_pid", 0))
-    if worker_pid and _process_alive(worker_pid):
+    if worker_pid and _worker_process_matches(worker_pid, task_id):
+        last_hb = latest.get("last_heartbeat_at")
+        if last_hb:
+            try:
+                hb_time = datetime.fromisoformat(last_hb).timestamp()
+                if time.time() - hb_time > STALLED_HEARTBEAT_SECONDS:
+                    latest = _load_task_state(task_id)
+                    if latest.get("status") not in ACTIVE_STATUSES:
+                        return latest
+                    recheck_hb = latest.get("last_heartbeat_at")
+                    if recheck_hb:
+                        try:
+                            recheck_time = datetime.fromisoformat(recheck_hb).timestamp()
+                            if time.time() - recheck_time <= STALLED_HEARTBEAT_SECONDS:
+                                return latest
+                        except (ValueError, TypeError):
+                            pass
+                    latest["status"] = "stalled"
+                    latest["stall_reason"] = "heartbeat_expired"
+                    latest["worker_active"] = True
+                    latest["summary"] = (
+                        f"Worker heartbeat expired "
+                        f"({STALLED_HEARTBEAT_SECONDS}s), process may still be running"
+                    )
+                    _save_task_state(task_id, latest)
+                    return latest
+            except (ValueError, TypeError):
+                pass
         return latest
     if not worker_pid:
         updated_ts = float(latest.get("updated_ts", latest.get("created_ts", 0)))
@@ -1037,13 +1248,16 @@ def _refresh_stale_task(state: dict[str, Any]) -> dict[str, Any]:
     if latest.get("status") not in ACTIVE_STATUSES:
         return latest
     latest_worker_pid = int(latest.get("worker_pid", 0))
-    if latest_worker_pid and _process_alive(latest_worker_pid):
+    if latest_worker_pid and _worker_process_matches(latest_worker_pid, task_id):
         return latest
 
     child_pid = int(latest.get("child_pid", 0))
     if child_pid and not _terminate_orphan_group(child_pid):
         latest["status"] = "stalled"
+        latest["phase"] = "finished"
+        latest["stall_reason"] = "child_process_unstoppable"
         latest["worker_pid"] = 0
+        latest["worker_active"] = False
         latest["summary"] = (
             f"Worker exited unexpectedly; child process group {child_pid} "
             "could not be stopped"
@@ -1055,37 +1269,80 @@ def _refresh_stale_task(state: dict[str, Any]) -> dict[str, Any]:
 
     workdir = Path(latest["workdir"])
     latest["child_pid"] = 0
-    _finalize_state(latest, "failed", "Worker exited unexpectedly")
+    _finalize_state(latest, "worker_crashed", "Worker exited unexpectedly")
     _release_workdir(workdir, task_id, str(latest.get("lock_token", "")))
     return latest
 
 
-def _task_result_from_state(state: dict[str, Any]) -> dict[str, Any]:
+def _task_result_from_state(
+    state: dict[str, Any], detail: str = "brief"
+) -> dict[str, Any]:
     started_ts = float(state.get("started_ts") or state.get("created_ts") or time.time())
     ended_ts = float(state.get("finished_ts") or time.time())
-    return {
+    status = state["status"]
+    changed = state.get("changed_files", [])
+    verification = state.get("verification", [])
+    all_passed = all(item.get("passed", False) for item in verification) if verification else False
+    any_failed = any(not item.get("passed", False) for item in verification) if verification else False
+
+    if detail == "brief":
+        verify_conclusion = "pending"
+        if verification:
+            passed = sum(1 for v in verification if v.get("passed"))
+            verify_conclusion = f"{passed}/{len(verification)} passed"
+            if any_failed:
+                failed_cmds = [v.get("command", "")[:80] for v in verification if not v.get("passed")]
+                verify_conclusion += f"; failed: {'; '.join(failed_cmds[:3])}"
+
+        return {
+            "task_id": state["task_id"],
+            "status": status,
+            "phase": state.get("phase", _phase_for_status(status)),
+            "session_id": state.get("session_id", ""),
+            "iterations": state.get("iterations", 0),
+            "elapsed_seconds": round(max(0.0, ended_ts - started_ts), 1),
+            "last_event_at": state.get("last_event_at"),
+            "last_progress_at": state.get("last_progress_at"),
+            "progress_note": state.get("progress_note", ""),
+            "changed_files_count": len(changed),
+            "verification_conclusion": verify_conclusion,
+            "summary": state.get("summary", "")[:MAX_SUMMARY_CHARS],
+            "log_path": state.get("log_path", ""),
+            "recommended_next_action": _recommend_next_action(status),
+            "worker_active": state.get("worker_active", False),
+            "stall_reason": state.get("stall_reason", ""),
+        }
+
+    result: dict[str, Any] = {
         "task_id": state["task_id"],
-        "status": state["status"],
+        "status": status,
+        "phase": state.get("phase", _phase_for_status(status)),
         "session_id": state.get("session_id", ""),
         "iterations": state.get("iterations", 0),
         "elapsed_seconds": round(max(0.0, ended_ts - started_ts), 1),
         "last_event_at": state.get("last_event_at"),
-        "changed_files": _compress_changed_files(state.get("changed_files", [])),
-        "verification": _compress_verification_result(state.get("verification", [])),
+        "last_progress_at": state.get("last_progress_at"),
+        "progress_note": state.get("progress_note", ""),
+        "changed_files": _compress_changed_files(changed),
+        "verification": _compress_verification_result(verification),
         "summary": state.get("summary", "")[:MAX_SUMMARY_CHARS],
         "log_path": state.get("log_path", ""),
+        "recommended_next_action": _recommend_next_action(status),
+        "key_decisions": state.get("key_decisions", []),
+        "known_issues": state.get("known_issues", []),
     }
+    return result
 
 
-def _get_task_result(task_id: str) -> dict[str, Any]:
+def _get_task_result(task_id: str, detail: str = "brief") -> dict[str, Any]:
     state = _refresh_stale_task(_load_task_state(task_id))
-    return _task_result_from_state(state)
+    return _task_result_from_state(state, detail=detail)
 
 
-def _wait_for_task(task_id: str, wait_seconds: int) -> dict[str, Any]:
+def _wait_for_task(task_id: str, wait_seconds: int, detail: str = "brief") -> dict[str, Any]:
     deadline = time.monotonic() + wait_seconds
     while True:
-        result = _get_task_result(task_id)
+        result = _get_task_result(task_id, detail=detail)
         if result["status"] in TERMINAL_STATUSES or time.monotonic() >= deadline:
             return result
         time.sleep(0.2)
@@ -1122,6 +1379,7 @@ def _new_task_state(
         "verification": [],
         "summary": "",
         "status": "queued",
+        "phase": "queued",
         "worker_pid": 0,
         "child_pid": 0,
         "log_path": str(LOGS_DIR / f"{task_id}.log"),
@@ -1133,6 +1391,13 @@ def _new_task_state(
         "finished_at": None,
         "finished_ts": None,
         "last_event_at": None,
+        "last_heartbeat_at": None,
+        "last_progress_at": None,
+        "progress_note": "",
+        "key_decisions": [],
+        "known_issues": [],
+        "stall_reason": "",
+        "worker_active": False,
         "revision": 0,
     }
 
@@ -1196,7 +1461,7 @@ def delegate_task(
         _finalize_state(state, "failed", f"Failed to launch worker: {error}")
         _release_workdir(workdir_path, task_id, lock_token)
         raise
-    return _wait_for_task(task_id, wait_seconds)
+    return _wait_for_task(task_id, wait_seconds, detail="brief")
 
 
 @mcp.tool()
@@ -1204,13 +1469,24 @@ def continue_task(
     task_id: str,
     feedback: str,
     wait_seconds: int = DEFAULT_WAIT_SECONDS,
+    resume_intent: str = "",
 ) -> dict[str, Any]:
-    """Resume a completed task in its existing MiMo session."""
+    """Resume a completed task in its existing MiMo session.
+
+    resume_intent is optional metadata describing why you are continuing:
+    e.g. "resume_work", "fix_verification", "address_review", "retry_transient".
+    It does not change behavior but is recorded for observability.
+    scope_violation tasks cannot be continued regardless of intent.
+    """
     if not isinstance(feedback, str) or len(feedback) > MAX_FEEDBACK_LEN:
         raise ValueError(
             f"feedback must be a string of at most {MAX_FEEDBACK_LEN} chars"
         )
     _validate_nonblank(feedback, "feedback")
+    if resume_intent and not isinstance(resume_intent, str):
+        raise TypeError("resume_intent must be a string")
+    if resume_intent and len(resume_intent) > 500:
+        raise ValueError("resume_intent must be at most 500 chars")
     wait_seconds = _validate_int(wait_seconds, "wait_seconds", 0, MAX_WAIT_SECONDS)
     state = _refresh_stale_task(_load_task_state(task_id))
     if state["status"] in ACTIVE_STATUSES:
@@ -1219,6 +1495,12 @@ def continue_task(
         raise ValueError(
             f"Task {task_id} is in scope_violation status and cannot be continued"
         )
+    if state["status"] == "stalled":
+        if state.get("stall_reason") == "heartbeat_expired" and state.get("worker_active"):
+            raise ValueError(
+                f"Task {task_id} is stalled (heartbeat expired) but Worker "
+                "is still running. Check again later or cancel_task first."
+            )
 
     workdir = Path(state["workdir"])
     lock_token = _new_lock_token()
@@ -1226,11 +1508,19 @@ def continue_task(
     _cancel_path(task_id).unlink(missing_ok=True)
     state["lock_token"] = lock_token
     state["status"] = "queued"
+    state["phase"] = "queued"
     state["worker_pid"] = 0
     state["child_pid"] = 0
     state["verification"] = []
     state["summary"] = ""
+    state["stall_reason"] = ""
+    state["worker_active"] = False
+    state["last_heartbeat_at"] = None
+    state["last_progress_at"] = None
+    state["progress_note"] = ""
     state["resume_feedback"] = feedback
+    if resume_intent:
+        state["resume_intent"] = resume_intent
     state["finished_at"] = None
     state["finished_ts"] = None
     _save_task_state(task_id, state)
@@ -1240,13 +1530,21 @@ def continue_task(
         _finalize_state(state, "failed", f"Failed to launch worker: {error}")
         _release_workdir(workdir, task_id, lock_token)
         raise
-    return _wait_for_task(task_id, wait_seconds)
+    return _wait_for_task(task_id, wait_seconds, detail="brief")
 
 
 @mcp.tool()
-def task_result(task_id: str) -> dict[str, Any]:
-    """Return compact, non-blocking status for a delegated task."""
-    return _get_task_result(task_id)
+def task_result(task_id: str, detail: Literal["brief", "summary"] = "brief") -> dict[str, Any]:
+    """Return compact, non-blocking status for a delegated task.
+
+    detail="brief" (default): task_id, status, phase, counts, summary, next action.
+    detail="summary": adds changed_files list, verification details, key_decisions, known_issues.
+    For raw log snippets or verification output, use the task_evidence tool.
+    """
+    if detail not in ("brief", "summary"):
+        raise ValueError(f"detail must be 'brief' or 'summary', got '{detail}'")
+    state = _refresh_stale_task(_load_task_state(task_id))
+    return _task_result_from_state(state, detail=detail)
 
 
 @mcp.tool()
@@ -1255,7 +1553,7 @@ def wait_task(
 ) -> dict[str, Any]:
     """Wait briefly for a task to finish without stopping its background worker."""
     wait_seconds = _validate_int(wait_seconds, "wait_seconds", 0, MAX_WAIT_SECONDS)
-    return _wait_for_task(task_id, wait_seconds)
+    return _wait_for_task(task_id, wait_seconds, detail="brief")
 
 
 @mcp.tool()
@@ -1325,7 +1623,233 @@ def cancel_task(task_id: str) -> dict[str, Any]:
     return _task_result_from_state(state)
 
 
+@mcp.tool()
+def task_evidence(
+    task_id: str,
+    log_tail_lines: int = 50,
+    verification_output: bool = False,
+) -> dict[str, Any]:
+    """Return bounded log and verification evidence for debugging a delegated task.
+
+    log_tail_lines: number of tail lines from the MiMo log (0-200, default 50).
+    verification_output: if True, include compressed verification stdout/stderr.
+    All output is bounded to avoid flooding the caller context.
+    """
+    _validate_task_id(task_id)
+    log_tail_lines = _validate_int(
+        log_tail_lines, "log_tail_lines", 0, MAX_EVIDENCE_LOG_LINES
+    )
+    state = _load_task_state(task_id)
+    result: dict[str, Any] = {
+        "task_id": task_id,
+        "status": state.get("status", ""),
+        "phase": state.get("phase", ""),
+    }
+
+    log_path = Path(state.get("log_path", ""))
+    if log_path.exists() and log_tail_lines > 0:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        lines = content.splitlines()
+        tail = lines[-log_tail_lines:]
+        result["log_tail"] = "\n".join(tail)[:MAX_EVIDENCE_CHARS]
+    else:
+        result["log_tail"] = ""
+
+    if verification_output:
+        result["verification"] = _compress_verification_result(
+            state.get("verification", [])
+        )
+    else:
+        result["verification"] = []
+
+    return result
+
+
+def _doctor_check_mimo() -> tuple[str, str, str]:
+    """Check MiMo executable availability and --version. Returns (status, path, version_info)."""
+    try:
+        mimo = _locate_mimo()
+    except FileNotFoundError as exc:
+        return "error", str(exc), ""
+    try:
+        result = subprocess.run(
+            [mimo, "--version"], capture_output=True, text=True, timeout=5,
+        )
+        ver = result.stdout.strip()[:120] if result.returncode == 0 else ""
+        if not ver and result.returncode != 0:
+            ver = f"(exit {result.returncode})"
+    except subprocess.TimeoutExpired:
+        ver = "(timeout)"
+    except OSError as exc:
+        ver = f"(error: {str(exc)[:60]})"
+    return "ok", mimo, ver
+
+
+def _doctor_check_dirs() -> list[dict[str, Any]]:
+    """Check state directories writability."""
+    results = []
+    for label, path in [("tasks", TASKS_DIR), ("logs", LOGS_DIR), ("locks", LOCKS_DIR)]:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            test_file = path / ".doctor_probe"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            results.append({"path": str(path), "status": "ok"})
+        except Exception as exc:
+            results.append({"path": str(path), "status": "error", "error": str(exc)[:120]})
+    return results
+
+
+def _doctor_check_corrupt_states() -> list[dict[str, Any]]:
+    """Find unreadable or corrupt task state files."""
+    corrupt = []
+    if not TASKS_DIR.exists():
+        return corrupt
+    for path in TASKS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or "task_id" not in data:
+                corrupt.append({"file": str(path), "status": "missing_task_id"})
+        except (json.JSONDecodeError, OSError) as exc:
+            corrupt.append({"file": str(path), "status": "corrupt", "error": str(exc)[:80]})
+    return corrupt
+
+
+def _doctor_check_stale_locks() -> list[dict[str, Any]]:
+    """Find lock files whose owning task is no longer active."""
+    stale = []
+    if not LOCKS_DIR.exists():
+        return stale
+    for path in LOCKS_DIR.glob("*.lock"):
+        owner_id = ""
+        try:
+            owner_id, _ = _read_lock(path)
+            if not owner_id:
+                continue
+            owner_state = _load_task_state(owner_id)
+            if owner_state.get("status") in TERMINAL_STATUSES:
+                stale.append({"lock_file": str(path), "owner_task": owner_id, "owner_status": owner_state["status"]})
+        except (FileNotFoundError, ValueError, OSError):
+            stale.append({"lock_file": str(path), "owner_task": owner_id or "?", "owner_status": "unknown"})
+    return stale
+
+
+def _doctor_check_orphan_processes() -> list[dict[str, Any]]:
+    """Find child processes whose worker is dead."""
+    orphans = []
+    if not TASKS_DIR.exists():
+        return orphans
+    for path in TASKS_DIR.glob("*.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if state.get("status") not in ACTIVE_STATUSES:
+            continue
+        worker_pid = int(state.get("worker_pid", 0))
+        child_pid = int(state.get("child_pid", 0))
+        if worker_pid and not _process_alive(worker_pid) and child_pid and _process_group_alive(child_pid):
+            orphans.append({"task_id": state.get("task_id", ""), "child_pid": child_pid})
+    return orphans
+
+
+def _doctor_check_version() -> dict[str, Any]:
+    """Read installed plugin version and optionally compare with source manifest."""
+    plugin_json = Path(__file__).resolve().parent.parent / ".codex-plugin" / "plugin.json"
+    result: dict[str, Any] = {"version": "unknown", "source": "unreadable"}
+    try:
+        data = json.loads(plugin_json.read_text(encoding="utf-8"))
+        result = {"version": data.get("version", "unknown"), "source": str(plugin_json)}
+    except Exception:
+        pass
+    source_path = os.environ.get("MIMO_DELEGATOR_SOURCE_PATH", "")
+    if source_path:
+        try:
+            src_data = json.loads(Path(source_path).read_text(encoding="utf-8"))
+            src_ver = src_data.get("version", "unknown")
+            result["source_version"] = src_ver
+            result["version_match"] = result["version"] == src_ver
+        except Exception:
+            sp = Path(source_path)
+            if sp.is_dir():
+                result["source_version"] = "path-is-directory"
+            else:
+                result["source_version"] = "unreadable"
+            result["version_match"] = False
+    return result
+
+
+@mcp.tool()
+def doctor() -> dict[str, Any]:
+    """Diagnose delegator health: executable, dirs, state, locks, processes, version.
+
+    Diagnostic only — does not delete files, kill processes, or modify state.
+    Returns short actionable findings in Chinese and English.
+    """
+    findings: list[str] = []
+    findings_en: list[str] = []
+
+    mimo_status, mimo_detail, mimo_version = _doctor_check_mimo()
+    if mimo_status != "ok":
+        findings.append(f"MiMo 可执行文件异常: {mimo_detail}")
+        findings_en.append(f"MiMo executable issue: {mimo_detail}")
+    elif mimo_version and mimo_version.startswith("("):
+        findings.append(f"MiMo --version 异常: {mimo_version}")
+        findings_en.append(f"MiMo --version issue: {mimo_version}")
+
+    dirs = _doctor_check_dirs()
+    for d in dirs:
+        if d["status"] != "ok":
+            findings.append(f"目录不可写: {d['path']} ({d.get('error', '')})")
+            findings_en.append(f"Directory not writable: {d['path']} ({d.get('error', '')})")
+
+    corrupt = _doctor_check_corrupt_states()
+    for c in corrupt:
+        findings.append(f"损坏状态文件: {c['file']} ({c['status']})")
+        findings_en.append(f"Corrupt state file: {c['file']} ({c['status']})")
+
+    stale_locks = _doctor_check_stale_locks()
+    for lk in stale_locks:
+        findings.append(f"残留锁: {lk['lock_file']} (owner={lk['owner_task']}, status={lk['owner_status']})")
+        findings_en.append(f"Stale lock: {lk['lock_file']} (owner={lk['owner_task']}, status={lk['owner_status']})")
+
+    orphans = _doctor_check_orphan_processes()
+    for o in orphans:
+        findings.append(f"孤儿子进程: task={o['task_id']} child_pid={o['child_pid']}")
+        findings_en.append(f"Orphan child process: task={o['task_id']} child_pid={o['child_pid']}")
+
+    version_info = _doctor_check_version()
+
+    if version_info.get("source_version") and not version_info.get("version_match", True):
+        findings.append(
+            f"插件版本不一致: 已安装={version_info.get('version')}, 源码={version_info.get('source_version')}"
+        )
+        findings_en.append(
+            f"Plugin version mismatch: installed={version_info.get('version')}, source={version_info.get('source_version')}"
+        )
+    if version_info.get("source_version") in ("unreadable", "path-is-directory"):
+        findings.append("源码版本文件不可读或不是文件 (MIMO_DELEGATOR_SOURCE_PATH)")
+        findings_en.append("Source version file unreadable or not a file (MIMO_DELEGATOR_SOURCE_PATH)")
+
+    return {
+        "mimo": {"status": mimo_status, "detail": mimo_detail, "version": mimo_version},
+        "directories": dirs,
+        "corrupt_states": corrupt,
+        "stale_locks": stale_locks,
+        "orphan_processes": orphans,
+        "version": version_info,
+        "findings_zh": findings or ["一切正常"],
+        "findings_en": findings_en or ["All checks passed"],
+    }
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--worker":
         raise SystemExit(_worker_main(sys.argv[2]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--doctor":
+        import json as _json
+
+        result = doctor()
+        print(_json.dumps(result, indent=2, ensure_ascii=False))
+        raise SystemExit(0 if not result["findings_en"] or result["findings_en"] == ["All checks passed"] else 1)
     mcp.run(transport="stdio")
