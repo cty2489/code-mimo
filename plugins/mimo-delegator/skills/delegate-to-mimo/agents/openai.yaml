@@ -1,4 +1,4 @@
 interface:
-  display_name: "Delegate to MiMo"
-  short_description: "Delegate large tasks to MiMo CLI, save Codex tokens."
-  default_prompt: "Use $delegate-to-mimo to delegate a large coding task to MiMo via delegate_task, then independently verify the result."
+  display_name: "委派给 MiMo / Delegate to MiMo"
+  short_description: "用安全后台 Worker 执行大型 MiMo 任务 / Run substantial MiMo tasks in background workers."
+  default_prompt: "使用 $delegate-to-mimo 完成大型编码任务；不要高频查询，完成后独立检查并验证结果。 Use it for substantial coding work, avoid rapid polling, then independently inspect and verify."
